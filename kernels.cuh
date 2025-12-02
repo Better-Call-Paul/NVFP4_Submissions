@@ -11,6 +11,7 @@
 // TODO: might need to do some vectorization/packing later so will prob add more dtypes
 using __nv_fp4_e2m1 = fp4;
 using __nv_fp8_e4m3 = fp8;
+using half = fp16;
 
 template<typename D, typename AB, int M, int N, bool trans_a, bool trans_b, bool neg=false>
 __device__ static inline uint32_t instruction_descriptor() {
@@ -166,7 +167,16 @@ __device__ static inline void tensor_shared_mma(uint32_t d_tt_addr, uint32_t a_t
     );
 }
 
-__global__ void GEMV() {};
+
+/*
+ * A (M X K), fp4
+ * B (K X 1) fp4
+ * sfa (M X (K // 16)) * L, fp16
+ * sfb ((K// 16) * 1) * L, fp16
+ * C (M X 1), fp16
+ * 
+*/
+__global__ void gemv(fp4* A, fp4* B, fp16* sfa, fp16* sfb, fp16* C);
 
 
 
