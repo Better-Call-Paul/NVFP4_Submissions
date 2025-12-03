@@ -14,6 +14,35 @@ torch::Tensor cuda_nvfp4_gemm(torch::Tensor A,
 """
 
 gemm_cuda = r"""
+#include <assert.h>
+#include <cuda.h>
+#include <stdio.h>
+#include <random>
+#include <iostream>
+#include <cuda_runtime.h>
+
+#include <cuda_fp4.h>
+#include <cuda_fp8.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
+using fp4_e2m1 = __nv_fp4_e2m1;
+using fp4x2_e2m1 = __nv_fp4x2_e2m1;
+using fp8_e4m3 = __nv_fp8_e4m3;
+using fp16 = __half;
+
+#define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
+
+struct gemm_params
+{
+    int M, N, K;
+    void *__restrict__ a_ptr;
+    void *__restrict__ b_ptr;
+    void *__restrict__ sfa_ptr;
+    void *__restrict__ sfb_ptr;
+    void *__restrict__ c_ptr;
+};
+
 
 """
 
