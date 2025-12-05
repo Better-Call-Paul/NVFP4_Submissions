@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <random>
 #include <iostream>
+#include <utility>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
@@ -26,16 +27,21 @@ struct gemm_params
     void *__restrict__ sfa_ptr;
     void *__restrict__ sfb_ptr;
     void *__restrict__ c_ptr;
+
+    // needs to be passed from host for TMA
+    CUtensorMap* tensorMapA;
+    CUtensorMap* tensorMapB;
 };
 
 __device__ static __forceinline__ void mma(uint32_t d_tt_addr, uint64_t a_desc, uint64_t b_desc, uint32_t idesc)
 {
-    
+    /*
     // non block scaling
     asm volatile(
         "tcgen05.mma.cta_group::1.kindf8f6f4 [%0], [%1], %2, %3\n"
         :: "r"(d_tt_addr), "r"(a_tt_addr), "l"(b_desc), "r"(idesc), "n"(acc)
     );
+    */
 
     // block scaling
     // block16, block32
@@ -46,10 +52,84 @@ __device__ static __forceinline__ void mma(uint32_t d_tt_addr, uint64_t a_desc, 
     );
 }
 
-template<>
+template<int block_major_size, int block_minor_size>
+void create_tensor_map(CUtensorMap* tma_map, __nv_fp4x2_e2m1, int blocks_height, int blocks_width)
+{
+
+    const map_creation_result = cuTensorMapEncodeTiled(tma_map, __nv_fp4x2_e2m1, 2);
+
+    if (map_creation_result != CUDA_SUCCESS)
+    {
+        std::cerr << "Failed to create cuTensorMap " << map_creation_result << "\n";
+    }
+}
+
+template<int block_major_size, int block_minor_size>
+__host__ static __forceinline__ CUtensorMap* allocate_and_create_tensor_map(__nv_fp4x2_e2m1* src, int blocks_height, int blocks_width)
+{
+    CUtensorMap *tma_map_d;
+    cudaMalloc(&tma_map_d, sizeof(CUtensorMap));
+    CUtensorMap *tma_map_host;
+    create_tensor_map(tma_map_host, src, blocks_height, blocks_width);
+    cudaMemcpy(tma_map_d, &tma_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+    return tma_map_d;
+}
+
+template<int BM, int BN, int BK>
 __global__ void __launch_bounds__(1, 1)
 gemm_kernel(const __grid_constant__ gemm_params params)
 {
+
+    // Dataflow: gmem -> shmem (via TMA) -> load into tmem -> MMA -> epilogue/dequant in registers -> shmem (via TMA) -> gmem
+    const int tid = threadIdx.x;
+
+    const int batch = threadIdx.z;
+
+    const int num_blocks = CEIL_DIV(params.K, BK);
+
+    const __nv_fp4x2_e2m1* a = params.a_ptr;
+    const __nv_fp4x2_e2m1* b = params.b_ptr;
+
+    const __nv_fp8_e4m3* sfa = params.sfa_ptr;
+    const __nv_fp8_e4m3* sfb = params.sfb_ptr;
+
+    const __half* c = params.c_ptr;
+
+    // only one thread per group grabs tma
+
+    if (threadIdx.x == 0)
+    {
+
+    }
+
+    __syncthreads();
+
+    for (int block_k_iter = 0; block_k_iter < num_blocks; ++block_k_iter)
+    {
+        if (threadIdx.x == 0) // load
+        {
+            //sync after operation for TMA load
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes
+                
+            "
+            );
+
+
+        }
+        else // arrive at barrier
+        {
+            // arrive at tma_bar with a and b ptrs 
+
+        }
+
+        mma<>();
+    }
+
+    // sync before for TMA store 
+
+    // store back to C in gmem 
+
 
 }
 
@@ -80,16 +160,20 @@ torch::Tensor cuda_nvfp4_gemm(torch::Tensor A,
     params.sfa_ptr = SFA.data_ptr();
     params.sfb_ptr = SFB.data_ptr();
 
-    //TODO: set specific dims
+    // TODO: set specific dims
     dim3 grid(1, 1);
     dim3 block(1, 1, 1);
 
     gemm_kernel<><<<grid, block>>>(params);
 
+    return C;
 }
 
 int run_benchmark(size_t M, size_t N, size_t K, size_t L)
 {
+    // TODO: will autotune later
+    int BM = BN = BK = 64;
+
     cudaError_t cudaStatus;
 
     float *host_a = new float[M * K];
@@ -115,7 +199,6 @@ int run_benchmark(size_t M, size_t N, size_t K, size_t L)
     __half *host_c = new __half[M * N];
     __half *host_c_ref = new __half[M * N];
 
-    // ISSUE:
     for (int i = 0; i + 1 < M * K; i += 2) host_a_fp4x2[CEIL_DIV(i, 2)] = __nv_fp4x2_e2m1(__floats2half2_rn(host_a[i], host_a[i + 1]));
     for (int i = 0; i + 1 < K * N; i += 2) host_b_fp4x2[CEIL_DIV(i, 2)] = __nv_fp4x2_e2m1(__floats2half2_rn(host_b[i], host_b[i + 1]));
 
@@ -147,6 +230,12 @@ int run_benchmark(size_t M, size_t N, size_t K, size_t L)
 
     cudaMemcpy(d_sfa, host_sfa_fp8, M * CEIL_DIV(K, 16) * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice);
     cudaMemcpy(d_sfb, host_sfb_fp8, CEIL_DIV(K, 16) * N * sizeof(__nv_fp8_e4m3), cudaMemcpyHostToDevice);
+
+    // TODO: do I pass nvfp4x2 host into this or just fp32?
+    CUtensorMap* d_tma_map_a = allocate_and_create_tensor_map<BM, BK>(host_a, M / BM, K / BK);
+    // TODO: check that this is the right way to put the dims
+    CUtensorMap* d_tma_map_b = allocate_and_create_tensor_map<BN, BK>(host_b, N / BN, K / BK);
+
 
     // kernels
 
@@ -190,6 +279,7 @@ int main()
     //size_t M = 128, N = 7168, K = 16384, L = 1;
     //size_t M = 128, N = 4096, K = 7168, L = 1;
     size_t M = 128, N = 7168, K = 2048, L = 1;
+
 
     run_benchmark(M, N, K, L);
 
